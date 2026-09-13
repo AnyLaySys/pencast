@@ -17,7 +17,6 @@
 #include <sys/mount.h>
 #include <time.h>
 #include <unistd.h>
-
 #include <drm/drm.h>
 #include <drm/drm_mode.h>
 #include <linux/input.h>
@@ -38,12 +37,10 @@
 #define PROP_NAME "DeviceInterfaceGUIDs"
 #define DRM_FORMAT_ARGB8888 UINT32_C(0x34325241)
 #define INPUT_MAGIC "CMINPUT1"
-#define START_TIMEOUT_NS UINT64_C(45000000000)
 #define ROOT "/userdata/.pencast"
 #define GADGET "/sys/kernel/config/usb_gadget/rockchip"
 #define FUNCTION_PATH GADGET "/functions/ffs.pencast"
 #define LINK GADGET "/configs/b.1/f3"
-
 #define LE16(value) ((__le16)(value))
 #define LE32(value) ((__le32)(value))
 #define FFS_MS_OS_DESC_VERSION LE16(1)
@@ -154,12 +151,18 @@ struct scanout {
 };
 
 typedef void *tjhandle;
+
 typedef tjhandle (*tj_init_compress)(void);
-typedef int (*tj_compress)(tjhandle, const unsigned char *, int, int, int, int,
-                           unsigned char **, unsigned long *, int, int, int);
+
+typedef int (*tj_compress)(tjhandle, const unsigned char *, int, int, int, int, unsigned char **,
+                           unsigned long *, int, int, int);
+
 typedef unsigned long (*tj_buffer_size)(int, int, int);
+
 typedef unsigned char *(*tj_alloc)(int);
+
 typedef void (*tj_free)(unsigned char *);
+
 typedef int (*tj_destroy)(tjhandle);
 
 struct jpeg_encoder {
@@ -187,21 +190,24 @@ struct input_state {
     struct touch_input touch;
     int keyboard_fd;
     bool touching;
-    _Atomic uint32_t width;
-    _Atomic uint32_t height;
+    _Atomic uint32_t
+    width;
+    _Atomic uint32_t
+    height;
     _Atomic bool *streaming;
 };
 
 static volatile sig_atomic_t keep_running = 1;
+
 static void on_signal(int signal_number) {
-    (void)signal_number;
+    (void) signal_number;
     keep_running = 0;
 }
 
 static uint64_t monotonic_ns(void) {
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
-    return (uint64_t)now.tv_sec * UINT64_C(1000000000) + (uint64_t)now.tv_nsec;
+    return (uint64_t) now.tv_sec * UINT64_C(1000000000) + (uint64_t) now.tv_nsec;
 }
 
 static int write_all(int fd, const void *buffer, size_t length) {
@@ -214,6 +220,21 @@ static int write_all(int fd, const void *buffer, size_t length) {
             if (errno == EINTR) {
                 continue;
             }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                struct pollfd pollfd = {.fd = fd, .events = POLLOUT};
+                int result;
+                do {
+                    result = poll(&pollfd, 1, 100);
+                } while (result == 0 && keep_running);
+                if (!keep_running) {
+                    errno = ECANCELED;
+                    return -1;
+                }
+                if (result < 0 && errno != EINTR) {
+                    return -1;
+                }
+                continue;
+            }
             return -1;
         }
         if (written == 0) {
@@ -221,7 +242,7 @@ static int write_all(int fd, const void *buffer, size_t length) {
             return -1;
         }
         cursor += written;
-        length -= (size_t)written;
+        length -= (size_t) written;
     }
     return 0;
 }
@@ -265,8 +286,8 @@ static void init_interface(struct usb_interface_descriptor *descriptor) {
     descriptor->iInterface = 1;
 }
 
-static void init_endpoint(struct usb_endpoint_descriptor_no_audio *descriptor,
-                           uint8_t address, uint16_t packet_size) {
+static void init_endpoint(struct usb_endpoint_descriptor_no_audio *descriptor, uint8_t address,
+                          uint16_t packet_size) {
     memset(descriptor, 0, sizeof(*descriptor));
     descriptor->bLength = USB_DT_ENDPOINT_SIZE;
     descriptor->bDescriptorType = USB_DT_ENDPOINT;
@@ -277,7 +298,7 @@ static void init_endpoint(struct usb_endpoint_descriptor_no_audio *descriptor,
 
 static void copy_utf16le(__le16 *destination, const char *source, size_t source_length) {
     for (size_t index = 0; index < source_length; ++index) {
-        destination[index] = LE16((unsigned char)source[index]);
+        destination[index] = LE16((unsigned char) source[index]);
     }
 }
 
@@ -285,9 +306,8 @@ static void init_descriptors(struct descriptor_blob *descriptors) {
     memset(descriptors, 0, sizeof(*descriptors));
     descriptors->header.magic = LE32(FUNCTIONFS_DESCRIPTORS_MAGIC_V2);
     descriptors->header.length = LE32(sizeof(*descriptors));
-    descriptors->header.flags = LE32(FUNCTIONFS_HAS_FS_DESC |
-                                     FUNCTIONFS_HAS_HS_DESC |
-                                     FUNCTIONFS_HAS_MS_OS_DESC);
+    descriptors->header.flags = LE32(
+            FUNCTIONFS_HAS_FS_DESC | FUNCTIONFS_HAS_HS_DESC | FUNCTIONFS_HAS_MS_OS_DESC);
     descriptors->fs_count = LE32(3);
     descriptors->hs_count = LE32(3);
     descriptors->os_count = LE32(2);
@@ -300,8 +320,8 @@ static void init_descriptors(struct descriptor_blob *descriptors) {
     init_endpoint(&descriptors->hs_out, USB_DIR_OUT | 2, 512);
 
     descriptors->ms_compat.header.interface = 0;
-    descriptors->ms_compat.header.dwLength =
-        LE32(sizeof(struct usb_os_desc_header) + sizeof(struct usb_ext_compat_desc));
+    descriptors->ms_compat.header.dwLength = LE32(
+            sizeof(struct usb_os_desc_header) + sizeof(struct usb_ext_compat_desc));
     descriptors->ms_compat.header.bcdVersion = FFS_MS_OS_DESC_VERSION;
     descriptors->ms_compat.header.wIndex = LE16(4);
     descriptors->ms_compat.header.bCount = 1;
@@ -310,8 +330,8 @@ static void init_descriptors(struct descriptor_blob *descriptors) {
     memcpy(descriptors->ms_compat.feature.CompatibleID, "WINUSB", 6);
 
     descriptors->ms_property.header.interface = 0;
-    descriptors->ms_property.header.dwLength =
-        LE32(sizeof(struct usb_os_desc_header) + sizeof(struct ms_property_feature));
+    descriptors->ms_property.header.dwLength = LE32(
+            sizeof(struct usb_os_desc_header) + sizeof(struct ms_property_feature));
     descriptors->ms_property.header.bcdVersion = FFS_MS_OS_DESC_VERSION;
     descriptors->ms_property.header.wIndex = LE16(5);
     descriptors->ms_property.header.wCount = LE16(1);
@@ -336,7 +356,7 @@ static void init_strings(struct string_blob *strings) {
 static int open_endpoint(const char *mount_path, const char *endpoint_name, int flags) {
     char path[512];
     int count = snprintf(path, sizeof(path), "%s/%s", mount_path, endpoint_name);
-    if (count < 0 || (size_t)count >= sizeof(path)) {
+    if (count < 0 || (size_t) count >= sizeof(path)) {
         errno = ENAMETOOLONG;
         return -1;
     }
@@ -344,11 +364,7 @@ static int open_endpoint(const char *mount_path, const char *endpoint_name, int 
 }
 
 static int input_write(int fd, uint16_t type, uint16_t code, int32_t value) {
-    struct input_event event = {
-        .type = type,
-        .code = code,
-        .value = value,
-    };
+    struct input_event event = {.type = type, .code = code, .value = value,};
     return write_all(fd, &event, sizeof(event));
 }
 
@@ -357,10 +373,11 @@ static bool input_has(const unsigned long *bits, unsigned int code) {
 }
 
 static int input_open_touch(struct touch_input *touch) {
-    unsigned long types[(EV_MAX + sizeof(unsigned long) * CHAR_BIT) /
-                        (sizeof(unsigned long) * CHAR_BIT)] = {0};
-    unsigned long axes[(ABS_MAX + sizeof(unsigned long) * CHAR_BIT) /
-                       (sizeof(unsigned long) * CHAR_BIT)] = {0};
+    unsigned long types[
+            (EV_MAX + sizeof(unsigned long) * CHAR_BIT) / (sizeof(unsigned long) * CHAR_BIT)] = {0};
+    unsigned long axes[
+            (ABS_MAX + sizeof(unsigned long) * CHAR_BIT) / (sizeof(unsigned long) * CHAR_BIT)] = {
+                    0};
     DIR *directory = opendir("/dev/input");
     if (directory == NULL) {
         return -1;
@@ -371,7 +388,7 @@ static int input_open_touch(struct touch_input *touch) {
         }
         char path[PATH_MAX];
         int length = snprintf(path, sizeof(path), "/dev/input/%s", entry->d_name);
-        if (length < 0 || (size_t)length >= sizeof(path)) {
+        if (length < 0 || (size_t) length >= sizeof(path)) {
             continue;
         }
         int fd = open(path, O_RDWR | O_CLOEXEC);
@@ -395,13 +412,7 @@ static int input_open_touch(struct touch_input *touch) {
             continue;
         }
         closedir(directory);
-        *touch = (struct touch_input){
-            .fd = fd,
-            .x_min = x.minimum,
-            .x_max = x.maximum,
-            .y_min = y.minimum,
-            .y_max = y.maximum,
-        };
+        *touch = (struct touch_input) {.fd = fd, .x_min = x.minimum, .x_max = x.maximum, .y_min = y.minimum, .y_max = y.maximum,};
         return 0;
     }
     closedir(directory);
@@ -448,7 +459,7 @@ static int32_t input_scale(uint16_t value, uint32_t length, int32_t minimum, int
         return minimum;
     }
     return minimum +
-           (int32_t)((uint64_t)value * (uint64_t)(maximum - minimum) / (uint64_t)(length - 1));
+           (int32_t)((uint64_t) value * (uint64_t)(maximum - minimum) / (uint64_t)(length - 1));
 }
 
 static int input_touch(struct input_state *state, uint32_t action, uint16_t x, uint16_t y) {
@@ -476,14 +487,15 @@ static int input_touch(struct input_state *state, uint32_t action, uint16_t x, u
     }
     uint32_t width = atomic_load(&state->width);
     uint32_t height = atomic_load(&state->height);
-    if (action != INPUT_TOUCH_UP &&
-        (width == 0 || height == 0 ||
-         input_write(fd, EV_ABS, ABS_MT_POSITION_X,
-                     input_scale(x, width, touch->x_min, touch->x_max)) != 0 ||
-         input_write(fd, EV_ABS, ABS_MT_POSITION_Y,
-                     input_scale(y, height, touch->y_min, touch->y_max)) != 0 ||
-         input_write(fd, EV_ABS, ABS_MT_TOUCH_MAJOR, 1) != 0 ||
-         input_write(fd, EV_ABS, ABS_MT_PRESSURE, 1) != 0)) {
+    if (action != INPUT_TOUCH_UP && (width == 0 || height == 0 ||
+                                     input_write(fd, EV_ABS, ABS_MT_POSITION_X,
+                                                 input_scale(x, width, touch->x_min,
+                                                             touch->x_max)) != 0 ||
+                                     input_write(fd, EV_ABS, ABS_MT_POSITION_Y,
+                                                 input_scale(y, height, touch->y_min,
+                                                             touch->y_max)) != 0 ||
+                                     input_write(fd, EV_ABS, ABS_MT_TOUCH_MAJOR, 1) != 0 ||
+                                     input_write(fd, EV_ABS, ABS_MT_PRESSURE, 1) != 0)) {
         return -1;
     }
     return input_write(fd, EV_SYN, SYN_REPORT, 0);
@@ -513,22 +525,20 @@ static void scanout_release(struct scanout *scanout) {
 }
 
 static int drm_find_plane(int fd, uint32_t *plane_id) {
-    struct drm_set_client_cap capability = {
-        .capability = DRM_CLIENT_CAP_UNIVERSAL_PLANES,
-        .value = 1,
-    };
+    struct drm_set_client_cap capability = {.capability = DRM_CLIENT_CAP_UNIVERSAL_PLANES, .value = 1,};
     if (ioctl(fd, DRM_IOCTL_SET_CLIENT_CAP, &capability) != 0) {
         return -1;
     }
     struct drm_mode_get_plane_res resources = {0};
-    if (ioctl(fd, DRM_IOCTL_MODE_GETPLANERESOURCES, &resources) != 0 || resources.count_planes == 0) {
+    if (ioctl(fd, DRM_IOCTL_MODE_GETPLANERESOURCES, &resources) != 0 ||
+        resources.count_planes == 0) {
         return -1;
     }
     uint32_t *planes = calloc(resources.count_planes, sizeof(*planes));
     if (planes == NULL) {
         return -1;
     }
-    resources.plane_id_ptr = (uintptr_t)planes;
+    resources.plane_id_ptr = (uintptr_t) planes;
     if (ioctl(fd, DRM_IOCTL_MODE_GETPLANERESOURCES, &resources) != 0) {
         int saved_errno = errno;
         free(planes);
@@ -550,7 +560,7 @@ static int drm_find_plane(int fd, uint32_t *plane_id) {
             struct drm_gem_close close_request = {.handle = framebuffer.handles[0]};
             ioctl(fd, DRM_IOCTL_GEM_CLOSE, &close_request);
         }
-        uint64_t area = (uint64_t)framebuffer.width * (uint64_t)framebuffer.height;
+        uint64_t area = (uint64_t) framebuffer.width * (uint64_t) framebuffer.height;
         if (area > largest) {
             largest = area;
             *plane_id = plane.plane_id;
@@ -576,7 +586,7 @@ static int drm_open(uint32_t *plane_id) {
         }
         char path[PATH_MAX];
         int length = snprintf(path, sizeof(path), "/dev/dri/%s", entry->d_name);
-        if (length < 0 || (size_t)length >= sizeof(path)) {
+        if (length < 0 || (size_t) length >= sizeof(path)) {
             continue;
         }
         int fd = open(path, O_RDWR | O_CLOEXEC);
@@ -621,11 +631,8 @@ static int scanout_update(struct scanout *scanout, int drm_fd, uint32_t plane_id
         return -1;
     }
 
-    struct drm_prime_handle prime = {
-        .handle = framebuffer.handles[0],
-        .flags = DRM_CLOEXEC | DRM_RDWR,
-        .fd = -1,
-    };
+    struct drm_prime_handle prime = {.handle = framebuffer.handles[0], .flags = DRM_CLOEXEC |
+                                                                                DRM_RDWR, .fd = -1,};
     int export_result = ioctl(drm_fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &prime);
     struct drm_gem_close close_request = {.handle = framebuffer.handles[0]};
     int close_result = ioctl(drm_fd, DRM_IOCTL_GEM_CLOSE, &close_request);
@@ -637,8 +644,8 @@ static int scanout_update(struct scanout *scanout, int drm_fd, uint32_t plane_id
         return -1;
     }
 
-    size_t mapping_size = (size_t)framebuffer.offsets[0] +
-                          (size_t)framebuffer.pitches[0] * (size_t)framebuffer.height;
+    size_t mapping_size = (size_t) framebuffer.offsets[0] +
+                          (size_t) framebuffer.pitches[0] * (size_t) framebuffer.height;
     void *mapping = mmap(NULL, mapping_size, PROT_READ, MAP_SHARED, prime.fd, 0);
     if (mapping == MAP_FAILED) {
         int saved_errno = errno;
@@ -680,12 +687,12 @@ static int jpeg_open(struct jpeg_encoder *encoder) {
         errno = ENOENT;
         return -1;
     }
-    init = (tj_init_compress)dlsym(encoder->library, "tjInitCompress");
-    encoder->compress = (tj_compress)dlsym(encoder->library, "tjCompress2");
-    encoder->buffer_size = (tj_buffer_size)dlsym(encoder->library, "tjBufSize");
-    encoder->alloc = (tj_alloc)dlsym(encoder->library, "tjAlloc");
-    encoder->free = (tj_free)dlsym(encoder->library, "tjFree");
-    encoder->destroy = (tj_destroy)dlsym(encoder->library, "tjDestroy");
+    init = (tj_init_compress) dlsym(encoder->library, "tjInitCompress");
+    encoder->compress = (tj_compress) dlsym(encoder->library, "tjCompress2");
+    encoder->buffer_size = (tj_buffer_size) dlsym(encoder->library, "tjBufSize");
+    encoder->alloc = (tj_alloc) dlsym(encoder->library, "tjAlloc");
+    encoder->free = (tj_free) dlsym(encoder->library, "tjFree");
+    encoder->destroy = (tj_destroy) dlsym(encoder->library, "tjDestroy");
     if (init == NULL || encoder->compress == NULL || encoder->buffer_size == NULL ||
         encoder->alloc == NULL || encoder->free == NULL || encoder->destroy == NULL) {
         errno = ENOSYS;
@@ -706,8 +713,7 @@ static int jpeg_prepare(struct jpeg_encoder *encoder, uint32_t width, uint32_t h
         errno = EOVERFLOW;
         return -1;
     }
-    unsigned long capacity =
-        encoder->buffer_size((int)width, (int)height, JPEG_SUBSAMPLING_444);
+    unsigned long capacity = encoder->buffer_size((int) width, (int) height, JPEG_SUBSAMPLING_444);
     if (capacity == 0 || capacity > INT_MAX) {
         errno = EOVERFLOW;
         return -1;
@@ -715,7 +721,7 @@ static int jpeg_prepare(struct jpeg_encoder *encoder, uint32_t width, uint32_t h
     if (encoder->buffer != NULL && encoder->capacity >= capacity) {
         return 0;
     }
-    unsigned char *buffer = encoder->alloc((int)capacity);
+    unsigned char *buffer = encoder->alloc((int) capacity);
     if (buffer == NULL) {
         errno = ENOMEM;
         return -1;
@@ -728,17 +734,18 @@ static int jpeg_prepare(struct jpeg_encoder *encoder, uint32_t width, uint32_t h
     return 0;
 }
 
-static int jpeg_encode(struct jpeg_encoder *encoder, const uint8_t *source, uint32_t width,
-                       uint32_t height, unsigned long *encoded_size) {
+static int
+jpeg_encode(struct jpeg_encoder *encoder, const uint8_t *source, uint32_t width, uint32_t height,
+            unsigned long *encoded_size) {
     if (jpeg_prepare(encoder, width, height) != 0) {
         return -1;
     }
     unsigned char *buffer = encoder->buffer;
     unsigned long size = encoder->capacity;
-    if (encoder->compress(encoder->handle, source, (int)width, (int)(width * 4U), (int)height,
-                          JPEG_PIXEL_FORMAT, &buffer, &size, JPEG_SUBSAMPLING_444,
-                          JPEG_QUALITY, JPEG_FLAGS) != 0 ||
-        buffer != encoder->buffer || size == 0 || size > UINT32_MAX) {
+    if (encoder->compress(encoder->handle, source, (int) width, (int) (width * 4U), (int) height,
+                          JPEG_PIXEL_FORMAT, &buffer, &size, JPEG_SUBSAMPLING_444, JPEG_QUALITY,
+                          JPEG_FLAGS) != 0 || buffer != encoder->buffer || size == 0 ||
+        size > UINT32_MAX) {
         errno = EIO;
         return -1;
     }
@@ -759,17 +766,17 @@ static int send_frame(int endpoint, struct scanout *scanout, int drm_fd, uint32_
     }
     atomic_store(&input->width, scanout->width);
     atomic_store(&input->height, scanout->height);
-    size_t row = (size_t)scanout->width * 4U;
+    size_t row = (size_t) scanout->width * 4U;
     if (scanout->height > SIZE_MAX / row) {
         errno = EOVERFLOW;
         return -1;
     }
-    size_t packed_size = row * (size_t)scanout->height;
+    size_t packed_size = row * (size_t) scanout->height;
     if (packed_size > UINT32_MAX) {
         errno = EOVERFLOW;
         return -1;
     }
-    const uint8_t *pixels = (const uint8_t *)scanout->mapping + scanout->offset;
+    const uint8_t *pixels = (const uint8_t *) scanout->mapping + scanout->offset;
     if (*scratch_size < packed_size) {
         uint8_t *replacement = realloc(*scratch, packed_size);
         if (replacement == NULL) {
@@ -780,26 +787,16 @@ static int send_frame(int endpoint, struct scanout *scanout, int drm_fd, uint32_
         *scratch_size = packed_size;
     }
     for (uint32_t index = 0; index < scanout->height; ++index) {
-        memcpy(*scratch + (size_t)index * row, pixels + (size_t)index * scanout->pitch, row);
+        memcpy(*scratch + (size_t) index * row, pixels + (size_t) index * scanout->pitch, row);
     }
     if (*config_pending) {
-        *stream_config = (struct frame_header){
-            .magic = {'C', 'M', 'C', 'O', 'N', 'F', 'I', 'G'},
-            .width = scanout->width,
-            .height = scanout->height,
-            .pitch = (uint32_t)row,
-            .pixel_format = scanout->pixel_format,
-            .sequence = 0,
-            .timestamp_ns = monotonic_ns(),
-            .payload_size = (uint32_t)packed_size,
-            .flags = FRAME_FLAG_JPEG,
-        };
+        *stream_config = (struct frame_header) {.magic = {'C', 'M', 'C', 'O', 'N', 'F', 'I',
+                                                          'G'}, .width = scanout->width, .height = scanout->height, .pitch = (uint32_t) row, .pixel_format = scanout->pixel_format, .sequence = 0, .timestamp_ns = monotonic_ns(), .payload_size = (uint32_t) packed_size, .flags = FRAME_FLAG_JPEG,};
         if (write_all(endpoint, stream_config, sizeof(*stream_config)) != 0) {
             return -1;
         }
         *config_pending = false;
-    } else if (stream_config->width != scanout->width ||
-               stream_config->height != scanout->height ||
+    } else if (stream_config->width != scanout->width || stream_config->height != scanout->height ||
                stream_config->pitch != row ||
                stream_config->pixel_format != scanout->pixel_format ||
                stream_config->payload_size != packed_size) {
@@ -810,12 +807,10 @@ static int send_frame(int endpoint, struct scanout *scanout, int drm_fd, uint32_
     if (jpeg_encode(encoder, *scratch, scanout->width, scanout->height, &length) != 0) {
         return -1;
     }
-    struct packet_header packet = {
-        .magic = {'C', 'M', 'J', 'P', 'E', 'G', '0', '1'},
-        .payload_size = (uint32_t)length,
-    };
+    struct packet_header packet = {.magic = {'C', 'M', 'J', 'P', 'E', 'G', '0',
+                                             '1'}, .payload_size = (uint32_t) length,};
     if (write_all(endpoint, &packet, sizeof(packet)) != 0 ||
-        write_all(endpoint, encoder->buffer, (size_t)length) != 0) {
+        write_all(endpoint, encoder->buffer, (size_t) length) != 0) {
         return -1;
     }
     return 0;
@@ -823,52 +818,65 @@ static int send_frame(int endpoint, struct scanout *scanout, int drm_fd, uint32_
 
 static int handle_events(int ep0, const char *mount_path, int *ep_in, int *ep_out,
                          _Atomic bool *streaming) {
-    struct usb_functionfs_event events[8];
-    ssize_t read_count = read(ep0, events, sizeof(events));
-    if (read_count < 0) {
-        return errno == EINTR || errno == EAGAIN ? 0 : -1;
-    }
-    if (read_count == 0 || (read_count % sizeof(events[0])) != 0) {
-        errno = EPROTO;
-        return -1;
-    }
-
-    for (size_t index = 0; index < (size_t)read_count / sizeof(events[0]); ++index) {
-        switch (events[index].type) {
-        case FUNCTIONFS_ENABLE:
-            if (*ep_in < 0) {
-                *ep_in = open_endpoint(mount_path, "ep1", O_WRONLY);
-            }
-            if (*ep_out < 0) {
-                *ep_out = open_endpoint(mount_path, "ep2", O_RDONLY | O_NONBLOCK);
-            }
-            if (*ep_in < 0 || *ep_out < 0) {
-                return -1;
-            }
-            break;
-        case FUNCTIONFS_DISABLE:
-        case FUNCTIONFS_UNBIND:
-            if (*ep_in >= 0) {
-                close(*ep_in);
-                *ep_in = -1;
-            }
-            if (*ep_out >= 0) {
-                close(*ep_out);
-                *ep_out = -1;
-            }
-            atomic_store(streaming, false);
-            break;
-        default:
-            break;
-        }
-    }
-    return 0;
+struct usb_functionfs_event events[8];
+ssize_t read_count = read(ep0, events, sizeof(events));
+if (read_count < 0) {
+return errno == EINTR || errno == EAGAIN ? 0 : -1;
+}
+if (read_count == 0 || (read_count % sizeof(events[0])) != 0) {
+errno = EPROTO;
+return -1;
 }
 
-static int handle_command(const uint8_t *command, struct input_state *state,
-                           bool *config_pending, uint32_t *fps, uint64_t *next_frame_ns) {
+for (
+size_t index = 0;
+index < (size_t)read_count / sizeof(events[0]); ++index) {
+switch (events[index].type) {
+case FUNCTIONFS_ENABLE:
+if (*ep_in < 0) {
+*
+ep_in = open_endpoint(mount_path, "ep1", O_WRONLY | O_NONBLOCK);
+}
+if (*ep_out < 0) {
+*
+ep_out = open_endpoint(mount_path, "ep2", O_RDONLY | O_NONBLOCK);
+}
+if (*ep_in < 0 || *ep_out < 0) {
+return -1;
+}
+struct stop_command ready = {.magic = {'C', 'M', 'R', 'E', 'A', 'D', 'Y', '1'}};
+if (write_all(*ep_in, &ready, sizeof(ready)) != 0) {
+return -1;
+}
+break;
+        case FUNCTIONFS_DISABLE:
+        case FUNCTIONFS_UNBIND:
+            if (*ep_in >= 0 || *ep_out >= 0) {
+                keep_running = 0;
+            }
+            if (*ep_in >= 0) {
+close(*ep_in);
+*
+ep_in = -1;
+}
+if (*ep_out >= 0) {
+close(*ep_out);
+*
+ep_out = -1;
+}
+atomic_store(streaming, false
+);
+break;
+default:
+break;
+}}
+return 0;
+}
+
+static int handle_command(const uint8_t *command, struct input_state *state, bool *config_pending,
+                          uint32_t *fps, uint64_t *next_frame_ns) {
     if (memcmp(command, "CMSTART1", 8) == 0) {
-        const struct start_command *start = (const struct start_command *)command;
+        const struct start_command *start = (const struct start_command *) command;
         uint32_t requested_fps = start->fps;
         *fps = requested_fps == 0 ? DEFAULT_FPS : requested_fps;
         if (*fps > MAX_FPS) {
@@ -881,7 +889,7 @@ static int handle_command(const uint8_t *command, struct input_state *state,
         atomic_store(state->streaming, false);
         keep_running = 0;
     } else if (memcmp(command, INPUT_MAGIC, 8) == 0) {
-        const struct input_command *input = (const struct input_command *)command;
+        const struct input_command *input = (const struct input_command *) command;
         int result;
         if (input->action >= INPUT_TOUCH_DOWN && input->action <= INPUT_TOUCH_UP) {
             result = input_touch(state, input->action, input->x, input->y);
@@ -898,8 +906,9 @@ static int handle_command(const uint8_t *command, struct input_state *state,
     return 1;
 }
 
-static int handle_control(int endpoint, struct input_state *input, bool *config_pending,
-                          uint32_t *fps, uint64_t *next_frame_ns) {
+static int
+handle_control(int endpoint, struct input_state *input, bool *config_pending, uint32_t *fps,
+               uint64_t *next_frame_ns) {
     uint8_t commands[64];
     ssize_t length = read(endpoint, commands, sizeof(commands));
     if (length < 0) {
@@ -908,11 +917,11 @@ static int handle_control(int endpoint, struct input_state *input, bool *config_
     if (length == 0) {
         return 0;
     }
-    if ((size_t)length % sizeof(struct input_command) != 0) {
+    if ((size_t) length % sizeof(struct input_command) != 0) {
         errno = EPROTO;
         return -1;
     }
-    for (size_t offset = 0; offset < (size_t)length; offset += sizeof(struct input_command)) {
+    for (size_t offset = 0; offset < (size_t) length; offset += sizeof(struct input_command)) {
         if (handle_command(commands + offset, input, config_pending, fps, next_frame_ns) < 0) {
             return -1;
         }
@@ -931,10 +940,10 @@ static void *input_loop(void *argument) {
             }
             break;
         }
-        if (length == 0 || (size_t)length % sizeof(struct input_command) != 0) {
+        if (length == 0 || (size_t) length % sizeof(struct input_command) != 0) {
             break;
         }
-        for (size_t offset = 0; offset < (size_t)length; offset += sizeof(struct input_command)) {
+        for (size_t offset = 0; offset < (size_t) length; offset += sizeof(struct input_command)) {
             const uint8_t *command = commands + offset;
             if (memcmp(command, "CMSTOP01", 8) == 0) {
                 atomic_store(state->streaming, false);
@@ -944,7 +953,7 @@ static void *input_loop(void *argument) {
             if (memcmp(command, INPUT_MAGIC, 8) != 0) {
                 continue;
             }
-            const struct input_command *input = (const struct input_command *)command;
+            const struct input_command *input = (const struct input_command *) command;
             int result;
             if (input->action >= INPUT_TOUCH_DOWN && input->action <= INPUT_TOUCH_UP) {
                 result = input_touch(state, input->action, input->x, input->y);
@@ -976,13 +985,9 @@ int main(int argc, char **argv) {
     uint32_t plane_id = 0;
     pthread_t input_thread;
     struct scanout scanout = {.dma_buf_fd = -1, .mapping = MAP_FAILED};
-    _Atomic bool streaming = false;
-    struct input_state input = {
-        .endpoint = -1,
-        .touch = {.fd = -1},
-        .keyboard_fd = -1,
-        .streaming = &streaming,
-    };
+    _Atomic
+    bool streaming = false;
+    struct input_state input = {.endpoint = -1, .touch = {.fd = -1}, .keyboard_fd = -1, .streaming = &streaming,};
     uint8_t *scratch = NULL;
     size_t scratch_size = 0;
     struct jpeg_encoder encoder = {0};
@@ -990,13 +995,12 @@ int main(int argc, char **argv) {
     bool input_started = false;
     struct frame_header stream_config = {0};
     uint64_t next_frame_ns = 0;
-    uint64_t start_deadline = monotonic_ns() + START_TIMEOUT_NS;
 
     for (int index = 1; index < argc; ++index) {
         if (strcmp(argv[index], "--mount") == 0 && index + 1 < argc) {
             mount_path = argv[++index];
         } else if (strcmp(argv[index], "--fps") == 0 && index + 1 < argc) {
-            fps = (uint32_t)strtoul(argv[++index], NULL, 0);
+            fps = (uint32_t) strtoul(argv[++index], NULL, 0);
             if (fps == 0 || fps > MAX_FPS) {
                 fprintf(stderr, "fps must be between 1 and %u\n", MAX_FPS);
                 return 2;
@@ -1005,7 +1009,8 @@ int main(int argc, char **argv) {
             restore_udc = argv[++index];
             restore_product = argv[++index];
         } else {
-            fprintf(stderr, "Usage: %s [--mount PATH] [--fps N] [--restore UDC PRODUCT]\n", argv[0]);
+            fprintf(stderr, "Usage: %s [--mount PATH] [--fps N] [--restore UDC PRODUCT]\n",
+                    argv[0]);
             return 2;
         }
     }
@@ -1015,7 +1020,7 @@ int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
 
     int path_length = snprintf(ep0_path, sizeof(ep0_path), "%s/ep0", mount_path);
-    if (path_length < 0 || (size_t)path_length >= sizeof(ep0_path)) {
+    if (path_length < 0 || (size_t) path_length >= sizeof(ep0_path)) {
         fprintf(stderr, "ep0 path is too long\n");
         return 2;
     }
@@ -1055,14 +1060,9 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
     while (keep_running) {
-        if (!atomic_load(&streaming) && monotonic_ns() >= start_deadline) {
-            break;
-        }
         if (!atomic_load(&streaming) || ep_in < 0) {
-            struct pollfd fds[2] = {
-                {.fd = ep0, .events = POLLIN},
-                {.fd = ep_out, .events = POLLIN},
-            };
+            struct pollfd fds[2] = {{.fd = ep0, .events = POLLIN},
+                                    {.fd = ep_out, .events = POLLIN},};
             nfds_t count = !input_started && ep_out >= 0 ? 2 : 1;
             int poll_result = poll(fds, count, 1000);
             if (poll_result < 0) {
@@ -1105,15 +1105,15 @@ int main(int argc, char **argv) {
         uint64_t now = monotonic_ns();
         if (next_frame_ns != 0 && now < next_frame_ns) {
             uint64_t remaining_ns = next_frame_ns - now;
-            struct timespec delay = {
-                .tv_sec = (time_t)(remaining_ns / UINT64_C(1000000000)),
-                .tv_nsec = (long)(remaining_ns % UINT64_C(1000000000)),
-            };
+            struct timespec delay = {.tv_sec = (time_t)(
+                    remaining_ns / UINT64_C(1000000000)), .tv_nsec = (long) (remaining_ns %
+                                                                             UINT64_C(
+                                                                                     1000000000)),};
             nanosleep(&delay, NULL);
             continue;
         }
-        if (send_frame(ep_in, &scanout, drm_fd, plane_id, &input, &scratch, &scratch_size,
-                       &encoder, &config_pending, &stream_config) != 0) {
+        if (send_frame(ep_in, &scanout, drm_fd, plane_id, &input, &scratch, &scratch_size, &encoder,
+                       &config_pending, &stream_config) != 0) {
             perror("send frame");
             keep_running = 0;
         }
@@ -1121,7 +1121,7 @@ int main(int argc, char **argv) {
         next_frame_ns = next_frame_ns == 0 ? now + interval_ns : next_frame_ns + interval_ns;
     }
 
-cleanup:
+    cleanup:
     if (input_started) {
         pthread_cancel(input_thread);
         pthread_join(input_thread, NULL);

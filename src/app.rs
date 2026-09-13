@@ -274,55 +274,66 @@ fn stream_inner(
     pending: &AtomicBool,
     input: &Receiver<[u8; 16]>,
 ) -> Result<(), String> {
-    adb::provision()?;
-    let usb = adb::wait_for_usb(running)?;
-    *connection.lock().unwrap() = Some(Connection {
-        device: usb.device.0 as isize,
-        interface: usb.interface.0 as isize,
-        input: usb.input,
-        output: usb.output,
-    });
-    let mut start = [0u8; 16];
-    start[..8].copy_from_slice(b"CMSTART1");
-    start[8..12].copy_from_slice(&FPS.to_le_bytes());
-    let mut started = false;
-    let result = (|| {
-        usb.write(&start)?;
-        started = true;
-        let mut header = [0u8; 48];
-        usb.read_exact(&mut header)?;
-        let config = Config::parse(&header)?;
-        native_size(HWND(hwnd as *mut c_void), &config);
-        let maximum = config.payload;
-        let mut packet = [0u8; 16];
-        let mut encoded = vec![0u8; maximum];
-        let mut raw = vec![0u8; config.payload];
-        loop {
-            if !running.load(Ordering::Acquire) {
-                return Ok(());
+    for attempt in 0..2 {
+        let serial = adb::provision()?;
+        let usb = adb::wait_for_usb(running)?;
+        *connection.lock().unwrap() = Some(Connection {
+            device: usb.device.0 as isize,
+            interface: usb.interface.0 as isize,
+            input: usb.input,
+            output: usb.output,
+        });
+        let mut start = [0u8; 16];
+        start[..8].copy_from_slice(b"CMSTART1");
+        start[8..12].copy_from_slice(&FPS.to_le_bytes());
+        let result = (|| {
+            let mut ready = [0u8; 16];
+            usb.read_exact(&mut ready)?;
+            if &ready[..8] != b"CMREADY1" {
+                return Err(String::from("Invalid PenCast USB handshake"));
             }
-            usb.read_exact(&mut packet)?;
-            let length = packet_size(&packet, maximum)?;
-            usb.read_exact(&mut encoded[..length])?;
-            decode_jpeg(&encoded[..length], &config, &mut raw)?;
-            publish(frames, &config, &raw);
-            if !pending.swap(true, Ordering::AcqRel) {
-                notify(hwnd, WM_FRAME);
+            usb.write(&start)?;
+            let mut header = [0u8; 48];
+            usb.read_exact(&mut header)?;
+            let config = Config::parse(&header)?;
+            native_size(HWND(hwnd as *mut c_void), &config);
+            let maximum = config.payload;
+            let mut packet = [0u8; 16];
+            let mut encoded = vec![0u8; maximum];
+            let mut raw = vec![0u8; config.payload];
+            loop {
+                if !running.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                usb.read_exact(&mut packet)?;
+                let length = packet_size(&packet, maximum)?;
+                usb.read_exact(&mut encoded[..length])?;
+                decode_jpeg(&encoded[..length], &config, &mut raw)?;
+                publish(frames, &config, &raw);
+                if !pending.swap(true, Ordering::AcqRel) {
+                    notify(hwnd, WM_FRAME);
+                }
+                while let Ok(command) = input.try_recv() {
+                    usb.write(&command)?;
+                }
             }
-            while let Ok(command) = input.try_recv() {
-                usb.write(&command)?;
-            }
-        }
-    })();
-    if started {
+        })();
         let mut stop = [0u8; 16];
         stop[..8].copy_from_slice(b"CMSTOP01");
         let _ = usb.write(&stop);
+        usb.abort();
+        *connection.lock().unwrap() = None;
+        drop(usb);
+        if attempt == 0
+            && running.load(Ordering::Acquire)
+            && matches!(&result, Err(error) if error == "Invalid PenCast USB handshake")
+        {
+            adb::wait_for_cleanup(&serial, running)?;
+            continue;
+        }
+        return result;
     }
-    usb.abort();
-    *connection.lock().unwrap() = None;
-    drop(usb);
-    result
+    unreachable!()
 }
 
 fn native_size(hwnd: HWND, config: &Config) {

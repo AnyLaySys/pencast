@@ -1,4 +1,3 @@
-use std::ffi::c_void;
 use std::mem::size_of;
 
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
@@ -7,10 +6,9 @@ use windows::Win32::Devices::DeviceAndDriverInstallation::{
     SetupDiGetClassDevsW, SetupDiGetDeviceInterfaceDetailW,
 };
 use windows::Win32::Devices::Usb::{
-    PIPE_TRANSFER_TIMEOUT, USB_INTERFACE_DESCRIPTOR, UsbdPipeTypeBulk, WINUSB_INTERFACE_HANDLE,
-    WINUSB_PIPE_INFORMATION, WinUsb_AbortPipe, WinUsb_Free, WinUsb_GetOverlappedResult,
-    WinUsb_Initialize, WinUsb_QueryInterfaceSettings, WinUsb_QueryPipe, WinUsb_ReadPipe,
-    WinUsb_SetPipePolicy, WinUsb_WritePipe,
+    USB_INTERFACE_DESCRIPTOR, UsbdPipeTypeBulk, WINUSB_INTERFACE_HANDLE, WINUSB_PIPE_INFORMATION,
+    WinUsb_AbortPipe, WinUsb_Free, WinUsb_GetOverlappedResult, WinUsb_Initialize,
+    WinUsb_QueryInterfaceSettings, WinUsb_QueryPipe, WinUsb_ReadPipe, WinUsb_WritePipe,
 };
 use windows::Win32::Foundation::{CloseHandle, ERROR_IO_PENDING, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Storage::FileSystem::{
@@ -250,24 +248,6 @@ pub(crate) fn open() -> Result<Usb, String> {
             let _ = CloseHandle(device);
         }
         return Err(String::from("PenCast bulk endpoints are unavailable"));
-    }
-    let timeout = 30_000u32;
-    for endpoint in [input, output] {
-        if let Err(error) = unsafe {
-            WinUsb_SetPipePolicy(
-                interface,
-                endpoint,
-                PIPE_TRANSFER_TIMEOUT,
-                size_of::<u32>() as u32,
-                (&timeout as *const u32).cast::<c_void>(),
-            )
-        } {
-            unsafe {
-                let _ = WinUsb_Free(interface);
-                let _ = CloseHandle(device);
-            }
-            return Err(error.to_string());
-        }
     }
     Ok(Usb {
         device,

@@ -65,13 +65,11 @@ start() {
     old_product=$(cat "$GADGET/idProduct")
     "$WORKER" --mount "$MOUNT" --fps 60 --restore "$old_udc" "$old_product" > /dev/null 2>&1 &
     worker=$!
-    attempt=0
-    while [ "$attempt" -lt 30 ]; do
-        kill -0 "$worker" 2>/dev/null && [ -e "$MOUNT/ep1" ] && [ -e "$MOUNT/ep2" ] && break
+    while kill -0 "$worker" 2>/dev/null; do
+        [ -e "$MOUNT/ep1" ] && [ -e "$MOUNT/ep2" ] && break
         sleep 0.1
-        attempt=$((attempt + 1))
     done
-    kill -0 "$worker"
+    [ -e "$MOUNT/ep1" ] && [ -e "$MOUNT/ep2" ]
     echo "" > "$GADGET/UDC"
     sleep 0.1
     echo "0x0012" > "$GADGET/idProduct"
@@ -119,7 +117,7 @@ impl Drop for Staging {
     }
 }
 
-pub(crate) fn provision() -> Result<(), String> {
+pub(crate) fn provision() -> Result<String, String> {
     let serial = discover_adb_device()?;
     adb_shell(&serial, "mkdir -p /userdata/.pencast\n")?;
     let staging = Staging::new()?;
@@ -142,11 +140,21 @@ pub(crate) fn provision() -> Result<(), String> {
         Err(error) if transport_reset(&error) => {}
         Err(error) => return Err(error),
     }
+    Ok(serial)
+}
+
+pub(crate) fn wait_for_cleanup(serial: &str, running: &AtomicBool) -> Result<(), String> {
+    while adb_shell(serial, "[ ! -e /userdata/.pencast/armed ]").is_err() {
+        if !running.load(Ordering::Acquire) {
+            return Err(String::from("Cancelled"));
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
     Ok(())
 }
 
 pub(crate) fn wait_for_usb(running: &AtomicBool) -> Result<Usb, String> {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(6);
     let mut last_error = String::from("PenCast USB interface not found");
     while Instant::now() < deadline {
         if !running.load(Ordering::Acquire) {
