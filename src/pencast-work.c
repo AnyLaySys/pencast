@@ -14,6 +14,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/mount.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -37,6 +38,11 @@
 #define PROP_NAME "DeviceInterfaceGUIDs"
 #define DRM_FORMAT_ARGB8888 UINT32_C(0x34325241)
 #define INPUT_MAGIC "CMINPUT1"
+#define START_TIMEOUT_NS UINT64_C(45000000000)
+#define ROOT "/userdata/.pencast"
+#define GADGET "/sys/kernel/config/usb_gadget/rockchip"
+#define FUNCTION_PATH GADGET "/functions/ffs.pencast"
+#define LINK GADGET "/configs/b.1/f3"
 
 #define LE16(value) ((__le16)(value))
 #define LE32(value) ((__le32)(value))
@@ -218,6 +224,34 @@ static int write_all(int fd, const void *buffer, size_t length) {
         length -= (size_t)written;
     }
     return 0;
+}
+
+static void write_value(const char *path, const char *value) {
+    int fd = open(path, O_WRONLY | O_CLOEXEC);
+    if (fd >= 0) {
+        write_all(fd, value, strlen(value));
+        write_all(fd, "\n", 1);
+        close(fd);
+    }
+}
+
+static void restore_usb(const char *mount_path, const char *udc, const char *product) {
+    if (access(ROOT "/armed", F_OK) != 0) {
+        return;
+    }
+    write_value(GADGET "/UDC", "");
+    struct timespec delay = {.tv_nsec = 100000000L};
+    nanosleep(&delay, NULL);
+    unlink(LINK);
+    umount(mount_path);
+    rmdir(mount_path);
+    rmdir(FUNCTION_PATH);
+    write_value(GADGET "/idProduct", product);
+    write_value(GADGET "/UDC", udc);
+    unlink(ROOT "/armed");
+    unlink(ROOT "/agent.sh");
+    unlink(ROOT "/pencast-work");
+    rmdir(ROOT);
 }
 
 static void init_interface(struct usb_interface_descriptor *descriptor) {
@@ -845,6 +879,7 @@ static int handle_command(const uint8_t *command, struct input_state *state,
         *next_frame_ns = 0;
     } else if (memcmp(command, "CMSTOP01", 8) == 0) {
         atomic_store(state->streaming, false);
+        keep_running = 0;
     } else if (memcmp(command, INPUT_MAGIC, 8) == 0) {
         const struct input_command *input = (const struct input_command *)command;
         int result;
@@ -903,6 +938,7 @@ static void *input_loop(void *argument) {
             const uint8_t *command = commands + offset;
             if (memcmp(command, "CMSTOP01", 8) == 0) {
                 atomic_store(state->streaming, false);
+                keep_running = 0;
                 continue;
             }
             if (memcmp(command, INPUT_MAGIC, 8) != 0) {
@@ -927,6 +963,8 @@ static void *input_loop(void *argument) {
 
 int main(int argc, char **argv) {
     const char *mount_path = "/dev/usb-ffs/mirror";
+    const char *restore_udc = NULL;
+    const char *restore_product = NULL;
     uint32_t fps = DEFAULT_FPS;
     struct descriptor_blob descriptors;
     struct string_blob strings;
@@ -952,6 +990,7 @@ int main(int argc, char **argv) {
     bool input_started = false;
     struct frame_header stream_config = {0};
     uint64_t next_frame_ns = 0;
+    uint64_t start_deadline = monotonic_ns() + START_TIMEOUT_NS;
 
     for (int index = 1; index < argc; ++index) {
         if (strcmp(argv[index], "--mount") == 0 && index + 1 < argc) {
@@ -962,8 +1001,11 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "fps must be between 1 and %u\n", MAX_FPS);
                 return 2;
             }
+        } else if (strcmp(argv[index], "--restore") == 0 && index + 2 < argc) {
+            restore_udc = argv[++index];
+            restore_product = argv[++index];
         } else {
-            fprintf(stderr, "Usage: %s [--mount PATH] [--fps N]\n", argv[0]);
+            fprintf(stderr, "Usage: %s [--mount PATH] [--fps N] [--restore UDC PRODUCT]\n", argv[0]);
             return 2;
         }
     }
@@ -1013,6 +1055,9 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
     while (keep_running) {
+        if (!atomic_load(&streaming) && monotonic_ns() >= start_deadline) {
+            break;
+        }
         if (!atomic_load(&streaming) || ep_in < 0) {
             struct pollfd fds[2] = {
                 {.fd = ep0, .events = POLLIN},
@@ -1070,8 +1115,7 @@ int main(int argc, char **argv) {
         if (send_frame(ep_in, &scanout, drm_fd, plane_id, &input, &scratch, &scratch_size,
                        &encoder, &config_pending, &stream_config) != 0) {
             perror("send frame");
-            atomic_store(&streaming, false);
-            continue;
+            keep_running = 0;
         }
         uint64_t interval_ns = UINT64_C(1000000000) / fps;
         next_frame_ns = next_frame_ns == 0 ? now + interval_ns : next_frame_ns + interval_ns;
@@ -1101,6 +1145,9 @@ cleanup:
     }
     if (ep0 >= 0) {
         close(ep0);
+    }
+    if (restore_udc != NULL && restore_product != NULL) {
+        restore_usb(mount_path, restore_udc, restore_product);
     }
     return 0;
 }

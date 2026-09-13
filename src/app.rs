@@ -24,7 +24,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{HSTRING, PCWSTR, w};
 
-use crate::adb::TargetSession;
+use crate::adb;
 use crate::protocol::{Config, FPS, Frames, decode_jpeg, packet_size, publish};
 use crate::renderer::Renderer;
 
@@ -274,8 +274,8 @@ fn stream_inner(
     pending: &AtomicBool,
     input: &Receiver<[u8; 16]>,
 ) -> Result<(), String> {
-    let mut target = TargetSession::provision()?;
-    let usb = target.wait_for_usb(running)?;
+    adb::provision()?;
+    let usb = adb::wait_for_usb(running)?;
     *connection.lock().unwrap() = Some(Connection {
         device: usb.device.0 as isize,
         interface: usb.interface.0 as isize,
@@ -314,7 +314,7 @@ fn stream_inner(
             }
         }
     })();
-    if started && result.is_ok() && running.load(Ordering::Acquire) {
+    if started {
         let mut stop = [0u8; 16];
         stop[..8].copy_from_slice(b"CMSTOP01");
         let _ = usb.write(&stop);
@@ -322,12 +322,7 @@ fn stream_inner(
     usb.abort();
     *connection.lock().unwrap() = None;
     drop(usb);
-    let cleanup = target.stop();
-    match (result, cleanup) {
-        (Err(error), _) => Err(error),
-        (Ok(()), Err(error)) => Err(error),
-        (Ok(()), Ok(())) => Ok(()),
-    }
+    result
 }
 
 fn native_size(hwnd: HWND, config: &Config) {
