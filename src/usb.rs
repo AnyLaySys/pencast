@@ -65,7 +65,6 @@ impl Usb {
         unsafe {
             let _ = CancelIoEx(self.device, None);
             let _ = WinUsb_AbortPipe(self.interface, self.input);
-            let _ = WinUsb_AbortPipe(self.interface, self.output);
         }
     }
 }

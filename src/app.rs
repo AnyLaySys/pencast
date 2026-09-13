@@ -51,7 +51,6 @@ struct Connection {
     device: isize,
     interface: isize,
     input: u8,
-    output: u8,
 }
 
 fn notify(hwnd: isize, message: u32) {
@@ -72,7 +71,6 @@ fn abort(connection: &Arc<Mutex<Option<Connection>>>) {
         unsafe {
             let _ = CancelIoEx(HANDLE(connection.device as *mut c_void), None);
             let _ = WinUsb_AbortPipe(interface, connection.input);
-            let _ = WinUsb_AbortPipe(interface, connection.output);
         }
     }
 }
@@ -250,19 +248,19 @@ fn stream(
     pending: Arc<AtomicBool>,
     input: Receiver<[u8; 16]>,
 ) {
-    if let Err(error) = stream_inner(hwnd, &frames, &running, &connection, &pending, &input) {
-        if running.load(Ordering::Acquire) {
-            let error = HSTRING::from(error);
-            unsafe {
-                let _ = MessageBoxW(
-                    Some(HWND(hwnd as *mut c_void)),
-                    &error,
-                    w!("PenCast"),
-                    MB_ICONERROR,
-                );
-            }
-            notify(hwnd, WM_CLOSE);
+    if let Err(error) = stream_inner(hwnd, &frames, &running, &connection, &pending, &input)
+        && running.load(Ordering::Acquire)
+    {
+        let error = HSTRING::from(error);
+        unsafe {
+            let _ = MessageBoxW(
+                Some(HWND(hwnd as *mut c_void)),
+                &error,
+                w!("PenCast"),
+                MB_ICONERROR,
+            );
         }
+        notify(hwnd, WM_CLOSE);
     }
 }
 
@@ -275,13 +273,12 @@ fn stream_inner(
     input: &Receiver<[u8; 16]>,
 ) -> Result<(), String> {
     for attempt in 0..2 {
-        let serial = adb::provision()?;
+        let serial = adb::provision(running)?;
         let usb = adb::wait_for_usb(running)?;
         *connection.lock().unwrap() = Some(Connection {
             device: usb.device.0 as isize,
             interface: usb.interface.0 as isize,
             input: usb.input,
-            output: usb.output,
         });
         let mut start = [0u8; 16];
         start[..8].copy_from_slice(b"CMSTART1");

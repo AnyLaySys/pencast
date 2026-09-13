@@ -36,6 +36,7 @@
 #define INTERFACE_GUID "{D4C39B42-BA47-4E8D-83F8-DA4A3B6B8F35}"
 #define PROP_NAME "DeviceInterfaceGUIDs"
 #define DRM_FORMAT_ARGB8888 UINT32_C(0x34325241)
+#define DRM_FORMAT_NV12 UINT32_C(0x3231564e)
 #define INPUT_MAGIC "CMINPUT1"
 #define ROOT "/userdata/.pencast"
 #define GADGET "/sys/kernel/config/usb_gadget/rockchip"
@@ -144,6 +145,8 @@ struct scanout {
     uint32_t height;
     uint32_t pitch;
     uint32_t offset;
+    uint32_t chroma_pitch;
+    uint32_t chroma_offset;
     uint32_t pixel_format;
     int dma_buf_fd;
     void *mapping;
@@ -247,12 +250,28 @@ static int write_all(int fd, const void *buffer, size_t length) {
     return 0;
 }
 
-static void write_value(const char *path, const char *value) {
+static int write_value(const char *path, const char *value) {
+    char text[PATH_MAX];
+    int length = snprintf(text, sizeof(text), "%s\n", value);
+    if (length < 0 || (size_t) length >= sizeof(text)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
     int fd = open(path, O_WRONLY | O_CLOEXEC);
-    if (fd >= 0) {
-        write_all(fd, value, strlen(value));
-        write_all(fd, "\n", 1);
-        close(fd);
+    if (fd < 0) {
+        return -1;
+    }
+    int result = write_all(fd, text, (size_t) length);
+    int saved_errno = errno;
+    close(fd);
+    errno = saved_errno;
+    return result;
+}
+
+static void bind_udc(const char *udc) {
+    struct timespec delay = {.tv_nsec = 100000000L};
+    while (write_value(GADGET "/UDC", udc) != 0) {
+        nanosleep(&delay, NULL);
     }
 }
 
@@ -268,7 +287,7 @@ static void restore_usb(const char *mount_path, const char *udc, const char *pro
     rmdir(mount_path);
     rmdir(FUNCTION_PATH);
     write_value(GADGET "/idProduct", product);
-    write_value(GADGET "/UDC", udc);
+    bind_udc(udc);
     unlink(ROOT "/armed");
     unlink(ROOT "/agent.sh");
     unlink(ROOT "/pencast-work");
@@ -524,6 +543,39 @@ static void scanout_release(struct scanout *scanout) {
     scanout->mapping = MAP_FAILED;
 }
 
+static uint64_t plane_zpos(int fd, uint32_t plane_id) {
+    struct drm_mode_obj_get_properties object = {
+        .obj_id = plane_id,
+        .obj_type = DRM_MODE_OBJECT_PLANE,
+    };
+    if (ioctl(fd, DRM_IOCTL_MODE_OBJ_GETPROPERTIES, &object) != 0 || object.count_props == 0) {
+        return 0;
+    }
+    uint32_t *ids = calloc(object.count_props, sizeof(*ids));
+    uint64_t *values = calloc(object.count_props, sizeof(*values));
+    if (ids == NULL || values == NULL) {
+        free(ids);
+        free(values);
+        return 0;
+    }
+    object.props_ptr = (uintptr_t) ids;
+    object.prop_values_ptr = (uintptr_t) values;
+    uint64_t zpos = 0;
+    if (ioctl(fd, DRM_IOCTL_MODE_OBJ_GETPROPERTIES, &object) == 0) {
+        for (uint32_t index = 0; index < object.count_props; ++index) {
+            struct drm_mode_get_property property = {.prop_id = ids[index]};
+            if (ioctl(fd, DRM_IOCTL_MODE_GETPROPERTY, &property) == 0 &&
+                strcmp(property.name, "zpos") == 0) {
+                zpos = values[index];
+                break;
+            }
+        }
+    }
+    free(ids);
+    free(values);
+    return zpos;
+}
+
 static int drm_find_plane(int fd, uint32_t *plane_id) {
     struct drm_set_client_cap capability = {.capability = DRM_CLIENT_CAP_UNIVERSAL_PLANES, .value = 1,};
     if (ioctl(fd, DRM_IOCTL_SET_CLIENT_CAP, &capability) != 0) {
@@ -545,29 +597,23 @@ static int drm_find_plane(int fd, uint32_t *plane_id) {
         errno = saved_errno;
         return -1;
     }
-    uint64_t largest = 0;
+    uint64_t highest = 0;
+    bool found = false;
     for (uint32_t index = 0; index < resources.count_planes; ++index) {
         struct drm_mode_get_plane plane = {.plane_id = planes[index]};
         if (ioctl(fd, DRM_IOCTL_MODE_GETPLANE, &plane) != 0 || plane.crtc_id == 0 ||
             plane.fb_id == 0) {
             continue;
         }
-        struct drm_mode_fb_cmd2 framebuffer = {.fb_id = plane.fb_id};
-        if (ioctl(fd, DRM_IOCTL_MODE_GETFB2, &framebuffer) != 0) {
-            continue;
-        }
-        if (framebuffer.handles[0] != 0) {
-            struct drm_gem_close close_request = {.handle = framebuffer.handles[0]};
-            ioctl(fd, DRM_IOCTL_GEM_CLOSE, &close_request);
-        }
-        uint64_t area = (uint64_t) framebuffer.width * (uint64_t) framebuffer.height;
-        if (area > largest) {
-            largest = area;
+        uint64_t zpos = plane_zpos(fd, plane.plane_id);
+        if (!found || zpos > highest) {
+            found = true;
+            highest = zpos;
             *plane_id = plane.plane_id;
         }
     }
     free(planes);
-    if (largest == 0) {
+    if (!found) {
         errno = ENODATA;
         return -1;
     }
@@ -626,7 +672,12 @@ static int scanout_update(struct scanout *scanout, int drm_fd, uint32_t plane_id
         return -1;
     }
     if (framebuffer.handles[0] == 0 || framebuffer.width == 0 || framebuffer.height == 0 ||
-        framebuffer.width > UINT32_MAX / 4U || framebuffer.pitches[0] < framebuffer.width * 4U) {
+        (framebuffer.pixel_format != DRM_FORMAT_ARGB8888 && framebuffer.pixel_format != DRM_FORMAT_NV12) ||
+        (framebuffer.pixel_format == DRM_FORMAT_ARGB8888 &&
+         (framebuffer.width > UINT32_MAX / 4U || framebuffer.pitches[0] < framebuffer.width * 4U)) ||
+        (framebuffer.pixel_format == DRM_FORMAT_NV12 &&
+         ((framebuffer.width & 1U) != 0 || framebuffer.pitches[0] < framebuffer.width ||
+          framebuffer.pitches[1] < framebuffer.width))) {
         errno = ENOTSUP;
         return -1;
     }
@@ -636,6 +687,12 @@ static int scanout_update(struct scanout *scanout, int drm_fd, uint32_t plane_id
     int export_result = ioctl(drm_fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &prime);
     struct drm_gem_close close_request = {.handle = framebuffer.handles[0]};
     int close_result = ioctl(drm_fd, DRM_IOCTL_GEM_CLOSE, &close_request);
+    if (framebuffer.handles[1] != 0 && framebuffer.handles[1] != framebuffer.handles[0]) {
+        close_request.handle = framebuffer.handles[1];
+        if (ioctl(drm_fd, DRM_IOCTL_GEM_CLOSE, &close_request) != 0) {
+            close_result = -1;
+        }
+    }
     if (export_result != 0) {
         return -1;
     }
@@ -644,8 +701,28 @@ static int scanout_update(struct scanout *scanout, int drm_fd, uint32_t plane_id
         return -1;
     }
 
+    if ((size_t) framebuffer.height >
+        (SIZE_MAX - (size_t) framebuffer.offsets[0]) / (size_t) framebuffer.pitches[0]) {
+        close(prime.fd);
+        errno = EOVERFLOW;
+        return -1;
+    }
     size_t mapping_size = (size_t) framebuffer.offsets[0] +
                           (size_t) framebuffer.pitches[0] * (size_t) framebuffer.height;
+    if (framebuffer.pixel_format == DRM_FORMAT_NV12) {
+        size_t chroma_height = ((size_t) framebuffer.height + 1U) / 2U;
+        if (chroma_height >
+            (SIZE_MAX - (size_t) framebuffer.offsets[1]) / (size_t) framebuffer.pitches[1]) {
+            close(prime.fd);
+            errno = EOVERFLOW;
+            return -1;
+        }
+        size_t chroma_end = (size_t) framebuffer.offsets[1] +
+                            (size_t) framebuffer.pitches[1] * chroma_height;
+        if (chroma_end > mapping_size) {
+            mapping_size = chroma_end;
+        }
+    }
     void *mapping = mmap(NULL, mapping_size, PROT_READ, MAP_SHARED, prime.fd, 0);
     if (mapping == MAP_FAILED) {
         int saved_errno = errno;
@@ -659,6 +736,8 @@ static int scanout_update(struct scanout *scanout, int drm_fd, uint32_t plane_id
     scanout->height = framebuffer.height;
     scanout->pitch = framebuffer.pitches[0];
     scanout->offset = framebuffer.offsets[0];
+    scanout->chroma_pitch = framebuffer.pitches[1];
+    scanout->chroma_offset = framebuffer.offsets[1];
     scanout->pixel_format = framebuffer.pixel_format;
     scanout->dma_buf_fd = prime.fd;
     scanout->mapping = mapping;
@@ -753,6 +832,29 @@ jpeg_encode(struct jpeg_encoder *encoder, const uint8_t *source, uint32_t width,
     return 0;
 }
 
+static uint8_t byte_limit(int value) {
+    return (uint8_t) (value < 0 ? 0 : value > 255 ? 255 : value);
+}
+
+static void nv12_to_bgra(uint8_t *destination, const struct scanout *scanout) {
+    const uint8_t *luma = (const uint8_t *) scanout->mapping + scanout->offset;
+    const uint8_t *chroma = (const uint8_t *) scanout->mapping + scanout->chroma_offset;
+    for (uint32_t y = 0; y < scanout->height; ++y) {
+        const uint8_t *source_y = luma + (size_t) y * scanout->pitch;
+        const uint8_t *source_uv = chroma + (size_t) (y / 2U) * scanout->chroma_pitch;
+        uint8_t *target = destination + (size_t) y * scanout->width * 4U;
+        for (uint32_t x = 0; x < scanout->width; ++x) {
+            int c = (int) source_y[x] - 16;
+            int d = (int) source_uv[x & ~1U] - 128;
+            int e = (int) source_uv[(x & ~1U) + 1U] - 128;
+            target[4U * x] = byte_limit((298 * c + 516 * d + 128) >> 8);
+            target[4U * x + 1U] = byte_limit((298 * c - 100 * d - 208 * e + 128) >> 8);
+            target[4U * x + 2U] = byte_limit((298 * c + 409 * e + 128) >> 8);
+            target[4U * x + 3U] = 255;
+        }
+    }
+}
+
 static int send_frame(int endpoint, struct scanout *scanout, int drm_fd, uint32_t plane_id,
                       struct input_state *input, uint8_t **scratch, size_t *scratch_size,
                       struct jpeg_encoder *encoder, bool *config_pending,
@@ -760,7 +862,7 @@ static int send_frame(int endpoint, struct scanout *scanout, int drm_fd, uint32_
     if (scanout_update(scanout, drm_fd, plane_id) != 0) {
         return -1;
     }
-    if (scanout->pixel_format != DRM_FORMAT_ARGB8888) {
+    if (scanout->pixel_format != DRM_FORMAT_ARGB8888 && scanout->pixel_format != DRM_FORMAT_NV12) {
         errno = ENOTSUP;
         return -1;
     }
@@ -776,7 +878,6 @@ static int send_frame(int endpoint, struct scanout *scanout, int drm_fd, uint32_
         errno = EOVERFLOW;
         return -1;
     }
-    const uint8_t *pixels = (const uint8_t *) scanout->mapping + scanout->offset;
     if (*scratch_size < packed_size) {
         uint8_t *replacement = realloc(*scratch, packed_size);
         if (replacement == NULL) {
@@ -786,19 +887,24 @@ static int send_frame(int endpoint, struct scanout *scanout, int drm_fd, uint32_
         *scratch = replacement;
         *scratch_size = packed_size;
     }
-    for (uint32_t index = 0; index < scanout->height; ++index) {
-        memcpy(*scratch + (size_t) index * row, pixels + (size_t) index * scanout->pitch, row);
+    if (scanout->pixel_format == DRM_FORMAT_ARGB8888) {
+        const uint8_t *pixels = (const uint8_t *) scanout->mapping + scanout->offset;
+        for (uint32_t index = 0; index < scanout->height; ++index) {
+            memcpy(*scratch + (size_t) index * row, pixels + (size_t) index * scanout->pitch, row);
+        }
+    } else {
+        nv12_to_bgra(*scratch, scanout);
     }
     if (*config_pending) {
         *stream_config = (struct frame_header) {.magic = {'C', 'M', 'C', 'O', 'N', 'F', 'I',
-                                                          'G'}, .width = scanout->width, .height = scanout->height, .pitch = (uint32_t) row, .pixel_format = scanout->pixel_format, .sequence = 0, .timestamp_ns = monotonic_ns(), .payload_size = (uint32_t) packed_size, .flags = FRAME_FLAG_JPEG,};
+                                                          'G'}, .width = scanout->width, .height = scanout->height, .pitch = (uint32_t) row, .pixel_format = DRM_FORMAT_ARGB8888, .sequence = 0, .timestamp_ns = monotonic_ns(), .payload_size = (uint32_t) packed_size, .flags = FRAME_FLAG_JPEG,};
         if (write_all(endpoint, stream_config, sizeof(*stream_config)) != 0) {
             return -1;
         }
         *config_pending = false;
     } else if (stream_config->width != scanout->width || stream_config->height != scanout->height ||
                stream_config->pitch != row ||
-               stream_config->pixel_format != scanout->pixel_format ||
+               stream_config->pixel_format != DRM_FORMAT_ARGB8888 ||
                stream_config->payload_size != packed_size) {
         errno = EPIPE;
         return -1;
@@ -948,6 +1054,7 @@ static void *input_loop(void *argument) {
             if (memcmp(command, "CMSTOP01", 8) == 0) {
                 atomic_store(state->streaming, false);
                 keep_running = 0;
+                write_value(GADGET "/UDC", "");
                 continue;
             }
             if (memcmp(command, INPUT_MAGIC, 8) != 0) {

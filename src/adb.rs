@@ -31,7 +31,7 @@ restore() {
     sleep 0.1
     [ -L "$LINK" ] && rm "$LINK" || true
     echo "$old_product" > "$GADGET/idProduct"
-    [ -n "$old_udc" ] && echo "$old_udc" > "$GADGET/UDC"
+    [ -n "$old_udc" ] && until (echo "$old_udc" > "$GADGET/UDC") 2>/dev/null; do sleep 0.1; done
 }
 
 discard() {
@@ -77,7 +77,7 @@ start() {
         cd "$GADGET"
         ln -s "functions/$FUNCTION" "configs/b.1/f3"
     )
-    echo "$old_udc" > "$GADGET/UDC"
+    until (echo "$old_udc" > "$GADGET/UDC") 2>/dev/null; do sleep 0.1; done
     : > "$ARM"
     trap - EXIT HUP INT TERM
 }
@@ -117,8 +117,8 @@ impl Drop for Staging {
     }
 }
 
-pub(crate) fn provision() -> Result<String, String> {
-    let serial = discover_adb_device()?;
+pub(crate) fn provision(running: &AtomicBool) -> Result<String, String> {
+    let serial = wait_for_adb_device(running)?;
     adb_shell(&serial, "mkdir -p /userdata/.pencast\n")?;
     let staging = Staging::new()?;
     let agent = staging.file("agent.sh");
@@ -260,6 +260,22 @@ fn discover_adb_device() -> Result<String, String> {
             "Multiple ADB devices found:\n{}\nRun: pencast -s <serial>",
             devices.join("\n")
         )),
+    }
+}
+
+fn wait_for_adb_device(running: &AtomicBool) -> Result<String, String> {
+    loop {
+        match discover_adb_device() {
+            Ok(serial) => return Ok(serial),
+            Err(error)
+                if error == "No authorized ADB device was found"
+                    || error.starts_with("ADB device is unavailable:") => {}
+            Err(error) => return Err(error),
+        }
+        if !running.load(Ordering::Acquire) {
+            return Err(String::from("Cancelled"));
+        }
+        thread::sleep(Duration::from_millis(100));
     }
 }
 
