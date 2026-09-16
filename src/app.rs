@@ -292,9 +292,9 @@ fn stream_inner(
             usb.write(&start)?;
             let mut header = [0u8; 48];
             usb.read_exact(&mut header)?;
-            let config = Config::parse(&header)?;
+            let mut config = Config::parse(&header)?;
             native_size(HWND(hwnd as *mut c_void), &config);
-            let maximum = config.payload;
+            let mut maximum = config.payload;
             let mut packet = [0u8; 16];
             let mut encoded = vec![0u8; maximum];
             let mut raw = vec![0u8; config.payload];
@@ -303,6 +303,17 @@ fn stream_inner(
                     return Ok(());
                 }
                 usb.read_exact(&mut packet)?;
+                if &packet[..8] == b"CMCONFIG" {
+                    let mut header = [0u8; 48];
+                    header[..16].copy_from_slice(&packet);
+                    usb.read_exact(&mut header[16..])?;
+                    config = Config::parse(&header)?;
+                    native_size(HWND(hwnd as *mut c_void), &config);
+                    maximum = config.payload;
+                    encoded.resize(maximum, 0);
+                    raw.resize(config.payload, 0);
+                    continue;
+                }
                 let length = packet_size(&packet, maximum)?;
                 usb.read_exact(&mut encoded[..length])?;
                 decode_jpeg(&encoded[..length], &config, &mut raw)?;

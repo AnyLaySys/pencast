@@ -895,6 +895,11 @@ static int send_frame(int endpoint, struct scanout *scanout, int drm_fd, uint32_
     } else {
         nv12_to_bgra(*scratch, scanout);
     }
+    if (stream_config->width != scanout->width || stream_config->height != scanout->height ||
+        stream_config->pitch != row || stream_config->pixel_format != DRM_FORMAT_ARGB8888 ||
+        stream_config->payload_size != packed_size) {
+        *config_pending = true;
+    }
     if (*config_pending) {
         *stream_config = (struct frame_header) {.magic = {'C', 'M', 'C', 'O', 'N', 'F', 'I',
                                                           'G'}, .width = scanout->width, .height = scanout->height, .pitch = (uint32_t) row, .pixel_format = DRM_FORMAT_ARGB8888, .sequence = 0, .timestamp_ns = monotonic_ns(), .payload_size = (uint32_t) packed_size, .flags = FRAME_FLAG_JPEG,};
@@ -902,12 +907,6 @@ static int send_frame(int endpoint, struct scanout *scanout, int drm_fd, uint32_
             return -1;
         }
         *config_pending = false;
-    } else if (stream_config->width != scanout->width || stream_config->height != scanout->height ||
-               stream_config->pitch != row ||
-               stream_config->pixel_format != DRM_FORMAT_ARGB8888 ||
-               stream_config->payload_size != packed_size) {
-        errno = EPIPE;
-        return -1;
     }
     unsigned long length = 0;
     if (jpeg_encode(encoder, *scratch, scanout->width, scanout->height, &length) != 0) {
@@ -1102,6 +1101,7 @@ int main(int argc, char **argv) {
     bool input_started = false;
     struct frame_header stream_config = {0};
     uint64_t next_frame_ns = 0;
+    uint64_t next_plane_probe_ns = 0;
 
     for (int index = 1; index < argc; ++index) {
         if (strcmp(argv[index], "--mount") == 0 && index + 1 < argc) {
@@ -1218,6 +1218,15 @@ int main(int argc, char **argv) {
                                                                                      1000000000)),};
             nanosleep(&delay, NULL);
             continue;
+        }
+        if (now >= next_plane_probe_ns) {
+            uint32_t current_plane;
+            if (drm_find_plane(drm_fd, &current_plane) == 0 && current_plane != plane_id) {
+                plane_id = current_plane;
+                scanout_release(&scanout);
+                config_pending = true;
+            }
+            next_plane_probe_ns = now + UINT64_C(250000000);
         }
         if (send_frame(ep_in, &scanout, drm_fd, plane_id, &input, &scratch, &scratch_size, &encoder,
                        &config_pending, &stream_config) != 0) {
